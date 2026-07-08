@@ -158,7 +158,7 @@ idf.py build
 idf.py -p COM3 flash monitor
 ```
 
-首次启动会进入配网模式，屏幕显示二维码，用手机扫码配置 Wi-Fi。
+首次启动会进入配网模式。
 
 远程舵机 WebSocket 默认关闭。公开代码中 `CONFIG_LUCKY_CAT_REMOTE_WS_URL` 为空，需要远程遥控时请在本地 `idf.py menuconfig` 或私有 `sdkconfig.defaults.local` 中设置自己的服务器地址。
 
