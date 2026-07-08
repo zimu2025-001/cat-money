@@ -1,0 +1,51 @@
+# ESP-IDF / build output
+**/build/
+**/managed_components/
+**/sdkconfig
+**/sdkconfig.old
+**/sdkconfig.defaults.local
+**/dependencies.lock
+**/camera_private_config.h
+**/*private_config.h
+**/*secrets*.h
+**/*secret*.h
+**/*credentials*.h
+
+# Generated files
+**/main/assets/lang_config.h
+**/main/mmap_generate_emoji.h
+**/mmap_generate_*.h
+**/convert_log.txt
+**/convert_result.txt
+
+# Binaries and intermediates
+*.o
+*.obj
+*.a
+*.bin
+*.elf
+*.map
+*.hex
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Node / frontend cache
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+
+# Editor / OS files
+.vscode/
+.idea/
+.cache/
+.env
+.DS_Store
+Thumbs.db
+
+# Misc temp
+tmp/
+dist/
+releases/

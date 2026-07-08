@@ -1,0 +1,11 @@
+.pio/
+.idea/
+.vscode/
+build/
+build-*/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+cmake-build-*/
+*.log
