@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import select
 import socket
 import struct
 import threading
@@ -110,8 +111,10 @@ class FrameBuffer:
 
     def wait_next(self, last_seq: int, timeout: float) -> tuple[Optional[bytes], int, float]:
         with self._cond:
-            if self._seq == last_seq:
-                self._cond.wait(timeout=timeout)
+            self._cond.wait_for(
+                lambda: self._jpeg is not None and self._seq > last_seq,
+                timeout=timeout,
+            )
             return self._jpeg, self._seq, self._last_ts
 
     def get_replay_frame(self, last_seq: int, latest_allowed_ts: float) -> tuple[Optional[bytes], int, float]:
@@ -179,14 +182,24 @@ class JpegExtractor:
 
 
 class FramedUdpJpegAssembler:
-    """Reassemble numbered UDP JPEG chunks sent by the ESP32 camera node."""
+    """Bounded, sender-isolated assembly; publish only newer complete frames.
+
+    ZMC1/2 have no boot/session identifier. Forget a sender's sequence after
+    stale_seconds without forward completion so a reboot cannot lock it out.
+    Delayed packets after that idle window cannot be distinguished from reboot.
+    """
 
     def __init__(self, max_frame_bytes: int, stale_seconds: float = UDP_FRAME_STALE_SECONDS) -> None:
         self._max_frame_bytes = max_frame_bytes
         self._stale_seconds = stale_seconds
-        self._frames: dict[int, dict[str, Any]] = {}
+        self._frames: dict[tuple[Any, int], dict[str, Any]] = {}
+        self._latest: dict[Any, tuple[int, float]] = {}
 
-    def feed(self, packet: bytes) -> list[bytes]:
+    @staticmethod
+    def _is_newer(frame_id: int, previous: int) -> bool:
+        return 0 < ((frame_id - previous) & 0xFFFFFFFF) < 0x80000000
+
+    def feed(self, packet: bytes, sender: Any = None) -> list[bytes]:
         if packet.startswith(UDP_FRAME_MAGIC_V2):
             header = UDP_FRAME_HEADER_V2
         elif packet.startswith(UDP_FRAME_MAGIC_V1):
@@ -198,76 +211,118 @@ class FramedUdpJpegAssembler:
             return []
 
         if header is UDP_FRAME_HEADER_V2:
-            _magic, frame_id, frame_len, frame_crc, chunk_index, chunk_count, payload_len = header.unpack_from(packet)
+            magic, frame_id, frame_len, frame_crc, chunk_index, chunk_count, payload_len = header.unpack_from(packet)
         else:
-            _magic, frame_id, frame_len, chunk_index, chunk_count, payload_len = header.unpack_from(packet)
+            magic, frame_id, frame_len, chunk_index, chunk_count, payload_len = header.unpack_from(packet)
             frame_crc = None
 
         payload = packet[header.size :]
         if (
             payload_len != len(payload)
             or payload_len == 0
-            or frame_len == 0
+            or frame_len < 4
             or frame_len > self._max_frame_bytes
+            or payload_len > frame_len
             or chunk_count == 0
-            or chunk_count > UDP_FRAME_MAX_CHUNKS
+            or chunk_count > min(UDP_FRAME_MAX_CHUNKS, frame_len)
             or chunk_index >= chunk_count
         ):
             return []
 
-        now = time.time()
+        now = time.monotonic()
         self._prune(now)
+        latest = self._latest.get(sender)
+        if latest is not None and not self._is_newer(frame_id, latest[0]):
+            return []
 
-        state = self._frames.get(frame_id)
-        if (
-            state is None
-            or state["frame_len"] != frame_len
-            or state.get("frame_crc") != frame_crc
-            or len(state["chunks"]) != chunk_count
-        ):
+        key = (sender, frame_id)
+        state = self._frames.get(key)
+        if state is None:
             state = {
                 "ts": now,
+                "magic": magic,
                 "frame_len": frame_len,
                 "frame_crc": frame_crc,
                 "chunks": [None] * chunk_count,
                 "received": 0,
                 "received_bytes": 0,
+                "invalid": False,
             }
-            self._frames[frame_id] = state
+            self._frames[key] = state
             self._trim_pending()
+        if state["invalid"]:
+            return []
+        if (
+            state["magic"] != magic
+            or state["frame_len"] != frame_len
+            or state["frame_crc"] != frame_crc
+            or len(state["chunks"]) != chunk_count
+        ):
+            self._invalidate(state)
+            return []
 
         chunks = state["chunks"]
-        if chunks[chunk_index] is None:
-            chunks[chunk_index] = payload
-            state["received"] += 1
-            state["received_bytes"] += payload_len
-            state["ts"] = now
+        if chunks[chunk_index] is not None:
+            if chunks[chunk_index] != payload:
+                self._invalidate(state)
+            return []
+        received_bytes = state["received_bytes"] + payload_len
+        # Each remaining chunk must contain at least one byte. Check before
+        # retaining payload or allocating the joined JPEG.
+        remaining = chunk_count - state["received"] - 1
+        if received_bytes + remaining > frame_len:
+            self._invalidate(state)
+            return []
+        chunks[chunk_index] = payload
+        state["received"] += 1
+        state["received_bytes"] = received_bytes
 
         if state["received"] != chunk_count:
             return []
+        if received_bytes != frame_len:
+            self._invalidate(state)
+            return []
 
         frame = b"".join(chunks)
-        self._frames.pop(frame_id, None)
-        if len(frame) != frame_len or not _is_complete_jpeg(frame):
-            return []
-        if frame_crc is not None and zlib.crc32(frame) & 0xFFFFFFFF != frame_crc:
+        if not _is_complete_jpeg(frame) or (
+            frame_crc is not None and zlib.crc32(frame) & 0xFFFFFFFF != frame_crc
+        ):
+            self._invalidate(state)
             return []
 
+        self._latest[sender] = (frame_id, now)
+        # Obsolete partial frames must not rewind the viewer when they finish.
+        for pending in list(self._frames):
+            if pending[0] == sender and not self._is_newer(pending[1], frame_id):
+                self._frames.pop(pending, None)
+        while len(self._latest) > UDP_FRAME_MAX_PENDING:
+            oldest_sender = min(self._latest, key=lambda peer: self._latest[peer][1])
+            self._latest.pop(oldest_sender, None)
         return [frame]
 
+    @staticmethod
+    def _invalidate(state: dict[str, Any]) -> None:
+        # Keep a bounded tombstone until expiry so conflicting chunks cannot
+        # restart this frame and accidentally validate a different assembly.
+        state["invalid"] = True
+        state["chunks"] = []
+        state["received_bytes"] = 0
+
     def _prune(self, now: float) -> None:
-        stale = [
-            frame_id
-            for frame_id, state in self._frames.items()
-            if now - float(state["ts"]) > self._stale_seconds
-        ]
-        for frame_id in stale:
-            self._frames.pop(frame_id, None)
+        for sender, (_frame_id, completed_at) in list(self._latest.items()):
+            if now - completed_at >= self._stale_seconds:
+                self._latest.pop(sender, None)
+                for key in list(self._frames):
+                    if key[0] == sender:
+                        self._frames.pop(key, None)
+        for key, state in list(self._frames.items()):
+            if now - float(state["ts"]) >= self._stale_seconds:
+                self._frames.pop(key, None)
 
     def _trim_pending(self) -> None:
         while len(self._frames) > UDP_FRAME_MAX_PENDING:
-            oldest_id = min(self._frames, key=lambda frame_id: float(self._frames[frame_id]["ts"]))
-            self._frames.pop(oldest_id, None)
+            oldest = min(self._frames, key=lambda key: float(self._frames[key]["ts"]))
+            self._frames.pop(oldest, None)
 
 
 class SerialControlBridge:
@@ -432,12 +487,12 @@ def udp_receiver(
     assembler = FramedUdpJpegAssembler(max_frame_bytes=extractor_max_bytes)
 
     while True:
-        data, _addr = sock.recvfrom(65535)
+        data, addr = sock.recvfrom(65535)
         if not data:
             continue
 
         if data.startswith(UDP_FRAME_MAGICS):
-            for frame in assembler.feed(data):
+            for frame in assembler.feed(data, sender=addr):
                 fb.update(frame)
             continue
 
@@ -874,6 +929,26 @@ class MjpegHandler(BaseHTTPRequestHandler):
         font-size: 12px;
         font-weight: 700;
       }
+      .video-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--line);
+        font-size: 13px;
+      }
+      .video-controls select, .video-controls button {
+        min-height: 36px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 10px;
+        background: #fff;
+        color: var(--ink);
+      }
+      .video-controls button { cursor: pointer; }
+      .video-controls button:disabled { cursor: default; opacity: 0.5; }
+      .video-controls output { color: var(--muted); }
       .video-stage {
         position: relative;
         background: #0d1419;
@@ -1125,13 +1200,24 @@ class MjpegHandler(BaseHTTPRequestHandler):
             </div>
             <div class="chip"><i class="dot"></i><span id="cameraAgeText">--</span></div>
           </div>
+          <div class="video-controls">
+            <label for="cameraMode">播放模式</label>
+            <select id="cameraMode">
+              <option value="live" selected>实时监控</option>
+              <option value="buffered">缓冲播放</option>
+            </select>
+            <button id="cameraStopButton" type="button" disabled>停止</button>
+            <button id="cameraRetryButton" type="button" disabled>重新连接</button>
+            <output id="cameraFpsText">接收 -- FPS</output>
+            <output id="cameraModeText">实时 · 不等待缓冲</output>
+          </div>
           <div class="video-stage">
             <img id="cameraStream" alt="喵掌柜远程看店画面" />
             <div id="cameraOverlay" class="video-placeholder">
               <div class="play-panel">
                 <div class="loading-spinner" aria-hidden="true"></div>
                 <button id="cameraPlayButton" type="button">开启播放</button>
-                <p id="cameraLoadText">点击后查看当前店内画面。</p>
+                <p id="cameraLoadText" role="status">点击后实时查看当前店内画面。</p>
               </div>
             </div>
           </div>
@@ -1188,10 +1274,15 @@ class MjpegHandler(BaseHTTPRequestHandler):
       const routeText = document.getElementById("routeText");
       const cameraText = document.getElementById("cameraText");
       const cameraAgeText = document.getElementById("cameraAgeText");
-      const cameraStream = document.getElementById("cameraStream");
+      let cameraStream = document.getElementById("cameraStream");
       const cameraOverlay = document.getElementById("cameraOverlay");
       const cameraPlayButton = document.getElementById("cameraPlayButton");
       const cameraLoadText = document.getElementById("cameraLoadText");
+      const cameraMode = document.getElementById("cameraMode");
+      const cameraStopButton = document.getElementById("cameraStopButton");
+      const cameraRetryButton = document.getElementById("cameraRetryButton");
+      const cameraFpsText = document.getElementById("cameraFpsText");
+      const cameraModeText = document.getElementById("cameraModeText");
       const deviceIdText = document.getElementById("deviceIdText");
       const identityText = document.getElementById("identityText");
       const cameraInfoText = document.getElementById("cameraInfoText");
@@ -1202,6 +1293,11 @@ class MjpegHandler(BaseHTTPRequestHandler):
       const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
       let cameraPlayRequested = false;
       let cameraPlaying = false;
+      let cameraStreamActive = false;
+      let cameraPageActive = true;
+      let cameraRequestSeq = 0;
+      let cameraRetryTimer = null;
+      let cameraFrameTimer = null;
       let lastCameraStatus = null;
 
       function setChip(el, state) {
@@ -1230,14 +1326,100 @@ class MjpegHandler(BaseHTTPRequestHandler):
         cameraLoadText.textContent = text;
       }
 
+      function disconnectCameraStream() {
+        clearTimeout(cameraRetryTimer);
+        clearInterval(cameraFrameTimer);
+        cameraRetryTimer = null;
+        cameraFrameTimer = null;
+        cameraStreamActive = false;
+        cameraPlaying = false;
+        cameraStream.onload = null;
+        cameraStream.onerror = null;
+        cameraStream.removeAttribute("src");
+      }
+
+      function renderCameraState() {
+        const camera = lastCameraStatus;
+        const buffered = cameraMode.value === "buffered";
+        const online = camera?.online === true;
+        const age = camera?.last_frame_age;
+        const fps = camera?.source_fps;
+        cameraStopButton.disabled = !cameraPlayRequested;
+        cameraRetryButton.disabled = !cameraPlayRequested;
+        cameraFpsText.textContent = `接收 ${online && Number.isFinite(fps) ? fps.toFixed(1) : "--"} FPS`;
+        cameraAgeText.textContent = Number.isFinite(age) ? `最新帧 ${Math.max(0, age).toFixed(1)} 秒前` : "等待画面";
+        cameraModeText.textContent = buffered
+          ? `缓冲 · 延迟 ${camera?.playback_delay ?? "--"} 秒`
+          : "实时 · 不等待缓冲";
+        setChip(cameraChip, online ? "good" : "warn");
+        if (!cameraPlayRequested) {
+          cameraOverlay.classList.remove("hidden", "loading");
+          cameraPlayButton.disabled = false;
+          cameraLoadText.textContent = buffered ? "缓冲播放需要先积累画面，会有延迟。" : "点击后实时查看当前店内画面。";
+          cameraText.textContent = online ? "画面在线" : "画面等待";
+          cameraInfoText.textContent = online ? "可开启观看" : "等待画面";
+        } else if (cameraRetryTimer !== null) {
+          setChip(cameraChip, "warn");
+          cameraText.textContent = "正在重连";
+          cameraInfoText.textContent = "播放连接中断";
+          showCameraLoading("播放连接中断，正在重新连接...");
+        } else if (!cameraStreamActive && buffered) {
+          cameraText.textContent = "正在缓冲";
+          cameraInfoText.textContent = "等待缓冲播放";
+          const seconds = Number(camera?.buffered_seconds || 0).toFixed(1);
+          showCameraLoading(`正在缓冲：${seconds}/${camera?.start_buffer_seconds ?? "--"} 秒，${camera?.buffered_frames ?? 0}/${camera?.start_buffer_frames ?? "--"} 帧。可切换实时监控。`);
+        } else if (!cameraPlaying || (!buffered && camera && !online)) {
+          cameraText.textContent = online ? "正在打开" : "等待画面";
+          cameraInfoText.textContent = online ? "正在连接画面" : "等待摄像头恢复";
+          showCameraLoading(online ? "正在连接画面..." : "等待摄像头画面，收到后自动播放...");
+        } else {
+          cameraOverlay.classList.add("hidden");
+          cameraOverlay.classList.remove("loading");
+          cameraText.textContent = buffered ? "缓冲播放" : "实时观看";
+          cameraInfoText.textContent = buffered ? (online ? "延迟画面" : "缓冲画面 · 摄像头离线") : "实时看店";
+        }
+      }
+
       function startCameraPlayback() {
-        if (cameraPlaying) return;
-        cameraPlaying = true;
-        cameraOverlay.classList.add("hidden");
-        cameraOverlay.classList.remove("loading");
-        cameraStream.src = `/mjpeg-buffered?start=${Date.now()}`;
-        cameraText.textContent = "正在观看";
-        cameraInfoText.textContent = "正在看店";
+        if (!cameraPageActive || !cameraPlayRequested || cameraStreamActive || cameraRetryTimer !== null) return;
+        const buffered = cameraMode.value === "buffered";
+        if (buffered && lastCameraStatus?.playback_ready !== true) return;
+        // A new image isolates late events from a stopped or replaced connection.
+        const stream = cameraStream.cloneNode(false);
+        stream.removeAttribute("src");
+        cameraStream.replaceWith(stream);
+        cameraStream = stream;
+        cameraStreamActive = true;
+        const isCurrentStream = () => cameraPlayRequested && cameraStreamActive && cameraStream === stream;
+        const markPlaying = () => {
+          if (!isCurrentStream() || stream.naturalWidth === 0) return;
+          cameraPlaying = true;
+          clearInterval(cameraFrameTimer);
+          cameraFrameTimer = null;
+          renderCameraState();
+        };
+        stream.onload = markPlaying;
+        stream.onerror = () => {
+          if (!isCurrentStream()) return;
+          disconnectCameraStream();
+          cameraRetryTimer = setTimeout(() => {
+            cameraRetryTimer = null;
+            startCameraPlayback();
+            renderCameraState();
+          }, 2000);
+          renderCameraState();
+        };
+        // MJPEG load events differ between browsers; dimensions prove a frame decoded.
+        cameraFrameTimer = setInterval(markPlaying, 250);
+        stream.src = `${buffered ? "/mjpeg-buffered" : "/mjpeg"}?start=${Date.now()}-${++cameraRequestSeq}`;
+      }
+
+      function requestCameraPlayback() {
+        if (cameraPlayRequested) return;
+        cameraPlayRequested = true;
+        startCameraPlayback();
+        renderCameraState();
+        refreshStatus();
       }
 
       function renderStatus(data) {
@@ -1249,24 +1431,8 @@ class MjpegHandler(BaseHTTPRequestHandler):
 
         if (camera) {
           lastCameraStatus = camera;
-          if (camera.online) {
-            setChip(cameraChip, "good");
-            cameraText.textContent = cameraPlaying ? "正在观看" : cameraPlayRequested ? "正在准备" : "画面在线";
-            cameraAgeText.textContent = "在线";
-            cameraInfoText.textContent = cameraPlaying ? "正在看店" : cameraPlayRequested ? "正在准备顺滑画面" : "可开启观看";
-          } else {
-            setChip(cameraChip, "warn");
-            cameraText.textContent = camera.last_frame_age === null ? "画面等待" : "正在恢复";
-            cameraAgeText.textContent = camera.last_frame_age === null ? "等待画面" : "恢复中";
-            cameraInfoText.textContent = camera.last_frame_age === null ? "等待画面" : "正在恢复";
-          }
-          if (cameraPlayRequested && !cameraPlaying) {
-            if (camera.playback_ready === true) {
-              startCameraPlayback();
-            } else {
-              showCameraLoading(camera.online ? "正在准备顺滑画面..." : "等待店内画面上线...");
-            }
-          }
+          startCameraPlayback();
+          renderCameraState();
         }
 
         if (route === "device") {
@@ -1349,13 +1515,32 @@ class MjpegHandler(BaseHTTPRequestHandler):
       for (const button of document.querySelectorAll("button[data-cmd]")) {
         button.addEventListener("click", () => sendCommand(button.dataset.cmd));
       }
-      cameraPlayButton.addEventListener("click", () => {
-        cameraPlayRequested = true;
-        cameraText.textContent = "正在打开";
-        showCameraLoading("正在准备顺滑画面...");
-        if (lastCameraStatus?.playback_ready === true) {
+      cameraPlayButton.addEventListener("click", requestCameraPlayback);
+      cameraStopButton.addEventListener("click", () => {
+        cameraPlayRequested = false;
+        disconnectCameraStream();
+        renderCameraState();
+      });
+      cameraRetryButton.addEventListener("click", () => {
+        if (!cameraPlayRequested) return;
+        disconnectCameraStream();
+        startCameraPlayback();
+        renderCameraState();
+      });
+      cameraMode.addEventListener("change", () => {
+        disconnectCameraStream();
+        startCameraPlayback();
+        renderCameraState();
+      });
+      window.addEventListener("pagehide", () => {
+        cameraPageActive = false;
+        disconnectCameraStream();
+      });
+      window.addEventListener("pageshow", (event) => {
+        cameraPageActive = true;
+        if (event.persisted) {
           startCameraPlayback();
-        } else {
+          renderCameraState();
           refreshStatus();
         }
       });
@@ -1399,29 +1584,46 @@ class MjpegHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _stream_mjpeg_live(self, fb: FrameBuffer) -> None:
-        self._send_mjpeg_headers()
-
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(5.0)
+        self.close_connection = True
         last_seq = -1
         try:
+            self._send_mjpeg_headers()
             while True:
-                jpeg, seq, _ts = fb.wait_next(last_seq, timeout=5.0)
+                if self._mjpeg_client_closed():
+                    return
+                jpeg, seq, _ts = fb.wait_next(last_seq, timeout=0.5)
                 if not jpeg or seq == last_seq:
                     continue
                 last_seq = seq
                 self._write_mjpeg_frame(jpeg)
-        except (ConnectionError, BrokenPipeError, ConnectionResetError):
+        except OSError:
             return
+        finally:
+            self.connection.settimeout(previous_timeout)
+
+    def _mjpeg_client_closed(self) -> bool:
+        # An idle stream never writes, so write errors alone cannot detect a
+        # browser stopping/replacing the image request. Peek without consuming
+        # input or changing socket modes used by other HTTP/WebSocket handlers.
+        readable, _, _ = select.select([self.connection], [], [], 0)
+        return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
 
     def _stream_mjpeg_replay(self, fb: FrameBuffer) -> None:
-        self._send_mjpeg_headers()
-
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(5.0)
+        self.close_connection = True
         replay_delay = self.server.camera_playback_delay  # type: ignore[attr-defined]
         replay_interval = 1.0 / max(0.1, float(self.server.camera_playback_fps))  # type: ignore[attr-defined]
         last_seq = -1
         last_jpeg: Optional[bytes] = None
 
         try:
+            self._send_mjpeg_headers()
             while True:
+                if self._mjpeg_client_closed():
+                    return
                 allowed_ts = time.time() - float(replay_delay)
                 jpeg, seq, _ts = fb.get_replay_frame(last_seq, allowed_ts)
                 if jpeg is not None and seq != last_seq:
@@ -1431,9 +1633,18 @@ class MjpegHandler(BaseHTTPRequestHandler):
                 elif last_jpeg is not None:
                     self._write_mjpeg_frame(last_jpeg)
 
-                time.sleep(replay_interval)
-        except (ConnectionError, BrokenPipeError, ConnectionResetError):
+                next_frame_at = time.monotonic() + replay_interval
+                while True:
+                    remaining = next_frame_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 0.5))
+                    if self._mjpeg_client_closed():
+                        return
+        except OSError:
             return
+        finally:
+            self.connection.settimeout(previous_timeout)
 
     def _handle_websocket(self) -> None:
         if self.headers.get("Upgrade", "").lower() != "websocket":

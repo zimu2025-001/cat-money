@@ -1,4 +1,6 @@
 #include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -9,6 +11,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -16,6 +19,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
+#include "cam_udp_protocol.h"
 
 #if __has_include("camera_private_config.h")
 #include "camera_private_config.h"
@@ -37,25 +41,50 @@
 #define ZHIMU_CAM_UDP_PORT 5000
 #endif
 
+#ifndef ZHIMU_CAM_TARGET_FPS
+#define ZHIMU_CAM_TARGET_FPS 15
+#endif
+
+#ifndef ZHIMU_CAM_SEND_BUDGET_MS
+#define ZHIMU_CAM_SEND_BUDGET_MS 100
+#endif
+
+#if ZHIMU_CAM_TARGET_FPS < 1 || ZHIMU_CAM_TARGET_FPS > 60
+#error "ZHIMU_CAM_TARGET_FPS must be between 1 and 60"
+#endif
+#if ZHIMU_CAM_SEND_BUDGET_MS < 1 || ZHIMU_CAM_SEND_BUDGET_MS > 1000
+#error "ZHIMU_CAM_SEND_BUDGET_MS must be between 1 and 1000"
+#endif
+
 #define WIFI_SSID ZHIMU_CAM_WIFI_SSID
 #define WIFI_PASS ZHIMU_CAM_WIFI_PASS
 #define UDP_HOST ZHIMU_CAM_UDP_HOST
 #define UDP_PORT ZHIMU_CAM_UDP_PORT
-#define UDP_MAX_PAYLOAD_BYTES 1400
-#define UDP_CHUNK_DELAY_MS 20
-#define FRAME_DELAY_MS 1
 #define WIFI_RECONNECT_DELAY_MS 2000
 #define CAMERA_RETRY_DELAY_MS 5000
 #define WIFI_MAX_TX_POWER 78
-#define STREAM_LOG_EVERY_N_FRAMES 60
+#define STREAM_LOG_INTERVAL_US (5LL * 1000000)
 
 #define WIFI_CONNECTED_BIT BIT0
 
-static const char *TAG = "cam_udp_raw";
+static const char *TAG = "cam_udp_zmc2";
 static EventGroupHandle_t s_wifi_event_group;
 static uint32_t s_frame_id;
-static uint32_t s_sent_count;
-static uint32_t s_drop_count;
+static uint8_t s_udp_packet[CAM_UDP_DATAGRAM_BYTES];
+static struct {
+    int64_t start_us;
+    uint32_t captured;
+    uint32_t sent;
+    uint32_t dropped;
+    uint32_t capture_errors;
+    uint32_t invalid;
+    uint32_t retries;
+    int last_errno;
+    uint64_t sent_bytes;
+    uint64_t capture_us;
+    uint64_t send_us;
+    uint64_t max_send_us;
+} s_stats;
 
 static camera_config_t camera_config = {
     .pin_pwdn = -1,
@@ -97,6 +126,7 @@ static void delay_ms(uint32_t ms)
 static bool is_complete_jpeg(const camera_fb_t *frame)
 {
     return frame != NULL &&
+           frame->buf != NULL &&
            frame->len >= 4 &&
            frame->buf[0] == 0xff &&
            frame->buf[1] == 0xd8 &&
@@ -125,10 +155,12 @@ static void log_camera_config(void)
              camera_config.pin_href,
              camera_config.pin_pclk);
     ESP_LOGI(TAG,
-             "camera stream: raw UDP JPEG bytes frame=VGA quality=%d payload=%d chunk_delay=%d ms",
+             "camera stream: ZMC2 frame=VGA quality=%d datagram=%u payload=%u target_fps=%d send_budget=%d ms",
              camera_config.jpeg_quality,
-             UDP_MAX_PAYLOAD_BYTES,
-             UDP_CHUNK_DELAY_MS);
+             (unsigned)CAM_UDP_DATAGRAM_BYTES,
+             (unsigned)CAM_UDP_PAYLOAD_BYTES,
+             ZHIMU_CAM_TARGET_FPS,
+             ZHIMU_CAM_SEND_BUDGET_MS);
 }
 
 static void apply_wifi_performance_mode(void)
@@ -200,7 +232,7 @@ static void apply_camera_tuning(void)
         sensor->set_dcw(sensor, 1);
     }
 
-    ESP_LOGI(TAG, "OV2640 tuned for raw UDP monitoring stream");
+    ESP_LOGI(TAG, "OV2640 tuned for ZMC2 UDP monitoring stream");
 }
 
 static void wifi_event_handler(void *arg,
@@ -311,8 +343,13 @@ static int create_udp_socket(struct sockaddr_in *dest_addr)
         return -1;
     }
 
-    int sndbuf = 32 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    /* Never block indefinitely if the Wi-Fi transmit queue is full. */
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ESP_LOGE(TAG, "unable to make UDP socket nonblocking: errno %d", errno);
+        close(sock);
+        return -1;
+    }
 
     memset(dest_addr, 0, sizeof(*dest_addr));
     dest_addr->sin_family = AF_INET;
@@ -326,77 +363,134 @@ static int create_udp_socket(struct sockaddr_in *dest_addr)
     return sock;
 }
 
-static bool send_udp_packet(int sock, const struct sockaddr_in *dest_addr, const uint8_t *data, size_t len)
+static bool send_udp_packet(int sock, const struct sockaddr_in *dest_addr,
+                            const uint8_t *data, size_t len, int64_t deadline_us)
 {
-    int sent = sendto(sock, data, len, 0, (const struct sockaddr *)dest_addr, sizeof(*dest_addr));
-    return sent == (int)len;
+    while (true) {
+        if ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
+            s_stats.last_errno = ENETDOWN;
+            return false;
+        }
+        if (esp_timer_get_time() >= deadline_us) {
+            s_stats.last_errno = ETIMEDOUT;
+            return false;
+        }
+
+        int sent = sendto(sock, data, len, 0,
+                          (const struct sockaddr *)dest_addr, sizeof(*dest_addr));
+        if (sent == (int)len) {
+            return true;
+        }
+
+        int send_errno = sent < 0 ? errno : EIO;
+        s_stats.last_errno = send_errno;
+        if (send_errno != ENOMEM && send_errno != ENOBUFS &&
+            send_errno != EAGAIN && send_errno != EWOULDBLOCK &&
+            send_errno != EINTR) {
+            return false;
+        }
+        /* Retry only this unqueued packet and only within this frame's budget.
+         * Yield to the network task under pressure, not after every packet. */
+        s_stats.retries++;
+        delay_ms(1);
+    }
 }
 
-static void send_frame_via_raw_udp(int sock, const struct sockaddr_in *dest_addr)
+static void send_frame_via_udp(int sock, const struct sockaddr_in *dest_addr)
 {
-    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-    if ((bits & WIFI_CONNECTED_BIT) == 0) {
-        ESP_LOGW(TAG, "Wi-Fi is offline, waiting before next frame");
+    if ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) == 0) {
         delay_ms(WIFI_RECONNECT_DELAY_MS);
         return;
     }
 
+    int64_t capture_start_us = esp_timer_get_time();
     camera_fb_t *frame = esp_camera_fb_get();
+    s_stats.capture_us += esp_timer_get_time() - capture_start_us;
     if (frame == NULL) {
-        ESP_LOGE(TAG, "failed to capture frame");
-        delay_ms(20);
+        s_stats.capture_errors++;
         return;
     }
 
-    if (!is_complete_jpeg(frame)) {
-        ESP_LOGW(TAG, "dropping incomplete JPEG frame: bytes=%u", (unsigned)frame->len);
-        esp_camera_fb_return(frame);
-        delay_ms(20);
-        return;
-    }
-
-    size_t sent_bytes = 0;
-    bool dropped = false;
+    s_stats.captured++;
     uint32_t frame_id = ++s_frame_id;
+    uint16_t chunk_count = cam_udp_chunk_count(frame->len);
+    if (!is_complete_jpeg(frame) || chunk_count == 0) {
+        s_stats.invalid++;
+        s_stats.dropped++;
+        esp_camera_fb_return(frame);
+        return;
+    }
 
-    while (sent_bytes < frame->len) {
-        size_t len = frame->len - sent_bytes;
-        if (len > UDP_MAX_PAYLOAD_BYTES) {
-            len = UDP_MAX_PAYLOAD_BYTES;
-        }
-
-        if (!send_udp_packet(sock, dest_addr, frame->buf + sent_bytes, len)) {
-            dropped = true;
+    int64_t send_start_us = esp_timer_get_time();
+    int64_t deadline_us = send_start_us + (int64_t)ZHIMU_CAM_SEND_BUDGET_MS * 1000;
+    uint32_t frame_crc = cam_udp_crc32(frame->buf, frame->len);
+    bool sent_frame = true;
+    for (uint16_t chunk = 0; chunk < chunk_count; ++chunk) {
+        size_t packet_len = cam_udp_encode_chunk(s_udp_packet, sizeof(s_udp_packet),
+                                                 frame->buf, frame->len,
+                                                 frame_id, frame_crc, chunk);
+        if (packet_len == 0 ||
+            !send_udp_packet(sock, dest_addr, s_udp_packet, packet_len, deadline_us)) {
+            sent_frame = false;
             break;
         }
-
-        sent_bytes += len;
-        delay_ms(UDP_CHUNK_DELAY_MS);
     }
 
-    if (dropped) {
-        s_drop_count++;
-        ESP_LOGW(TAG, "UDP raw frame dropped: id=%lu errno=%d bytes=%u sent=%u dropped=%lu",
-                 (unsigned long)frame_id,
-                 errno,
-                 (unsigned)frame->len,
-                 (unsigned)sent_bytes,
-                 (unsigned long)s_drop_count);
-        delay_ms(100);
+    uint64_t send_us = (uint64_t)(esp_timer_get_time() - send_start_us);
+    s_stats.send_us += send_us;
+    if (send_us > s_stats.max_send_us) {
+        s_stats.max_send_us = send_us;
+    }
+    if (sent_frame) {
+        s_stats.sent++;
+        s_stats.sent_bytes += frame->len;
     } else {
-        s_sent_count++;
-        if (frame_id <= 3 || (s_sent_count % STREAM_LOG_EVERY_N_FRAMES) == 0) {
-            ESP_LOGI(TAG,
-                     "UDP raw frame sent: id=%lu bytes=%u sent=%lu dropped=%lu",
-                     (unsigned long)frame_id,
-                     (unsigned)frame->len,
-                     (unsigned long)s_sent_count,
-                     (unsigned long)s_drop_count);
-        }
+        /* Do not resend old frames: the receiver discards partial/CRC-bad frames. */
+        s_stats.dropped++;
     }
-
+    /* Return the camera buffer before any pacing wait, on every captured path. */
     esp_camera_fb_return(frame);
-    delay_ms(FRAME_DELAY_MS);
+}
+
+static void log_stream_stats(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    int64_t elapsed_us = now_us - s_stats.start_us;
+    if (elapsed_us < STREAM_LOG_INTERVAL_US) {
+        return;
+    }
+    uint32_t capture_attempts = s_stats.captured + s_stats.capture_errors;
+    uint32_t send_attempts = s_stats.captured - s_stats.invalid;
+    ESP_LOGI(TAG,
+             "stream %.1fs: sent_fps=%.2f sent=%lu dropped=%lu capture_errors=%lu invalid=%lu "
+             "avg_jpeg=%.0f B capture=%.2f ms send=%.2f ms max_send=%.2f ms retries=%lu last_errno=%d",
+             elapsed_us / 1000000.0,
+             s_stats.sent * 1000000.0 / elapsed_us,
+             (unsigned long)s_stats.sent,
+             (unsigned long)s_stats.dropped,
+             (unsigned long)s_stats.capture_errors,
+             (unsigned long)s_stats.invalid,
+             s_stats.sent ? (double)s_stats.sent_bytes / s_stats.sent : 0.0,
+             capture_attempts ? s_stats.capture_us / (1000.0 * capture_attempts) : 0.0,
+             send_attempts ? s_stats.send_us / (1000.0 * send_attempts) : 0.0,
+             s_stats.max_send_us / 1000.0,
+             (unsigned long)s_stats.retries,
+             s_stats.last_errno);
+    memset(&s_stats, 0, sizeof(s_stats));
+    s_stats.start_us = now_us;
+}
+
+static void pace_frame(int64_t frame_start_us)
+{
+    int64_t remaining_us = 1000000LL / ZHIMU_CAM_TARGET_FPS -
+                           (esp_timer_get_time() - frame_start_us);
+    /* Round up to RTOS ticks. Slow frames never cause a catch-up burst, and
+     * even when over budget we yield so the idle/network tasks can run. */
+    TickType_t ticks = 1;
+    if (remaining_us > 0) {
+        ticks = (TickType_t)((remaining_us * configTICK_RATE_HZ + 999999) / 1000000);
+    }
+    vTaskDelay(ticks);
 }
 
 void app_main(void)
@@ -425,10 +519,14 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(TAG, "starting raw UDP camera stream to %s:%d", UDP_HOST, UDP_PORT);
+    ESP_LOGI(TAG, "starting ZMC2 UDP camera stream to %s:%d", UDP_HOST, UDP_PORT);
     warmup_camera_frames();
 
+    s_stats.start_us = esp_timer_get_time();
     while (true) {
-        send_frame_via_raw_udp(sock, &dest_addr);
+        int64_t frame_start_us = esp_timer_get_time();
+        send_frame_via_udp(sock, &dest_addr);
+        log_stream_stats();
+        pace_frame(frame_start_us);
     }
 }
