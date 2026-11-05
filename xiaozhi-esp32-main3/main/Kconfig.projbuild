@@ -981,7 +981,8 @@ menu "Lucky Cat Servo Control"
         depends on ENABLE_LUCKY_CAT_SERVO
         help
             Server WebSocket endpoint used by the device for remote servo control, for example ws://192.168.1.10:8080/device.
-            Leave empty to disable the device-side remote WebSocket client.
+            Used when neither the optional lucky_cat_private_config.h server IP nor a stored NVS URL overrides it.
+            Leave empty to disable the device-side remote WebSocket client when no override is present.
 endmenu
 
 endmenu

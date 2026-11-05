@@ -1,4 +1,5 @@
 #include "lucky_cat_servo_controller.h"
+#include "lucky_cat_remote_config.h"
 
 #include "board.h"
 #include "mcp_server.h"
@@ -183,8 +184,13 @@ private:
     }
 
     std::string GetRemoteUrl() {
+#ifdef ZHIMU_LUCKY_CAT_SERVER_IP
+        return lucky_cat_remote_config::ResolveUrl("");
+#else
         Settings settings("lucky_cat", false);
-        return settings.GetString("remote_ws_url", CONFIG_LUCKY_CAT_REMOTE_WS_URL);
+        return lucky_cat_remote_config::ResolveUrl(
+            settings.GetString("remote_ws_url", CONFIG_LUCKY_CAT_REMOTE_WS_URL));
+#endif
     }
 
     void RemoteTask() {
