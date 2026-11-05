@@ -1,4 +1,4 @@
-// Run with: node --test tests/test_camera_viewer.js (Node.js 18+).
+// From server/: node --test tests/test_camera_viewer.js (Node.js 18+).
 // Exercise the actual embedded viewer script without third-party DOM dependencies.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');

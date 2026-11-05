@@ -1,0 +1,4 @@
+# Build outputs relative to this Go module. Shared ignores live in ../.gitignore.
+/esp32-proxy
+/esp32-proxy.exe
+/coverage.out

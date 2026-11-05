@@ -1,0 +1,56 @@
+name: Go server
+
+on:
+  push:
+    branches: [components/server]
+    paths: [server/**, .github/workflows/server.yml]
+  pull_request:
+    branches: [components/server]
+    paths: [server/**, .github/workflows/server.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l *.go)"
+      - name: Go tests and race detector
+        run: go test -race -count=1 ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Build server
+        run: go build -o esp32-proxy .
+      - name: Firmware protocol and embedded viewer tests
+        run: python -m unittest discover -s tests -v
+      - name: Browser viewer tests
+        run: node --test tests/test_camera_viewer.js
+      - name: Cross-compile supported desktop platforms
+        shell: bash
+        run: |
+          for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -o "$RUNNER_TEMP/esp32-proxy-$os-$arch" .
+          done

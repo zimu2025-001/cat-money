@@ -1,7 +1,7 @@
 """Feed the firmware C encoder fixture's packets into the compiled Go server.
 
 These are host protocol tests, not an ESP-IDF build or hardware FPS benchmark.
-Run: python -m unittest discover -s tests -v
+From server/: python -m unittest discover -s tests -v
 Requires a C compiler and Go, or CAT_MONEY_SERVER_BINARY pointing to a built
 server. No Python server implementation or third-party Python packages are used.
 The verbatim firmware fixture and its provenance are in tests/fixtures/.
@@ -136,10 +136,11 @@ class FirmwareGoReceiverTests(FirmwareEncoderMixin, unittest.TestCase):
         self.http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.log = tempfile.TemporaryFile()
         self.addCleanup(self.log.close)
+        # Run outside the source tree so external web files cannot mask a broken embed.
         self.process = subprocess.Popen([
             self.binary, "--http-host", "127.0.0.1", "--http-port", str(self.http_port),
             "--udp-host", "127.0.0.1", "--udp-port", str(self.udp_port),
-        ], cwd=ROOT, stdout=self.log, stderr=subprocess.STDOUT)
+        ], cwd=self.temp.name, stdout=self.log, stderr=subprocess.STDOUT)
         self.addCleanup(self.stop_server)
         deadline = time.monotonic() + 5
         while True:
@@ -193,6 +194,16 @@ class FirmwareGoReceiverTests(FirmwareEncoderMixin, unittest.TestCase):
             if time.monotonic() >= deadline:
                 self.fail(f"expected camera sequence {seq}, got {status}")
             time.sleep(0.01)
+
+    def test_embedded_viewer_without_external_web_directory(self):
+        self.assertFalse((Path(self.temp.name) / "web").exists())
+        expected = (ROOT / "web/index.html").read_text(encoding="utf-8")
+        expected = expected.replace("__HOST__", f"127.0.0.1:{self.http_port}")
+        for route in ("/", "/index.html"):
+            with self.subTest(route=route):
+                with self.http.open(self.base + route, timeout=2) as response:
+                    self.assertEqual(response.headers.get_content_type(), "text/html")
+                    self.assertEqual(response.read().decode("utf-8"), expected)
 
     def test_encode_reassemble_boundaries(self):
         for seq, length in enumerate((4, 1377, 1378, 1379, 2756, 30720, 1024 * 1024), 1):
