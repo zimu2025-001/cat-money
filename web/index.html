@@ -1,0 +1,745 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>喵掌柜 AIoT 看店中控</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #172026;
+        --muted: #64707d;
+        --line: #d9dee5;
+        --paper: #fbfaf7;
+        --panel: #ffffff;
+        --jade: #127c72;
+        --gold: #c78522;
+        --coral: #b64734;
+        --steel: #30445a;
+        --shadow: 0 18px 48px rgba(29, 42, 54, 0.12);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.78), rgba(251,250,247,0.94)),
+          repeating-linear-gradient(90deg, rgba(18,124,114,0.055) 0 1px, transparent 1px 44px),
+          var(--paper);
+        color: var(--ink);
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      }
+      .wrap {
+        width: min(1440px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 24px 0 32px;
+        display: grid;
+        gap: 16px;
+      }
+      .topbar {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 16px;
+        align-items: end;
+        padding: 10px 0 6px;
+      }
+      .brand { display: grid; gap: 8px; }
+      .eyebrow {
+        color: var(--gold);
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(30px, 5vw, 54px);
+        line-height: 1;
+        letter-spacing: 0;
+      }
+      .tagline {
+        max-width: 780px;
+        margin: 0;
+        color: #3d4952;
+        font-size: 15px;
+        line-height: 1.7;
+      }
+      .status-stack {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+      .chip {
+        min-height: 34px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(255,255,255,0.86);
+        padding: 7px 12px;
+        color: #36434d;
+        font-size: 13px;
+        font-weight: 700;
+        box-shadow: 0 6px 18px rgba(23,32,38,0.06);
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #9aa4ad;
+      }
+      .chip.good .dot { background: #169b72; }
+      .chip.warn .dot { background: var(--gold); }
+      .chip.bad .dot { background: var(--coral); }
+      .main-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.9fr) minmax(320px, 0.75fr);
+        gap: 16px;
+      }
+      .panel {
+        background: rgba(255,255,255,0.92);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+      .panel-head {
+        min-height: 58px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        border-bottom: 1px solid var(--line);
+        padding: 14px 16px;
+      }
+      .panel-title {
+        margin: 0;
+        font-size: 17px;
+        line-height: 1.25;
+        letter-spacing: 0;
+      }
+      .panel-kicker {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .video-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--line);
+        font-size: 13px;
+      }
+      .video-controls select, .video-controls button {
+        min-height: 36px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 10px;
+        background: #fff;
+        color: var(--ink);
+      }
+      .video-controls button { cursor: pointer; }
+      .video-controls button:disabled { cursor: default; opacity: 0.5; }
+      .video-controls output { color: var(--muted); }
+      .video-stage {
+        position: relative;
+        background: #0d1419;
+        padding: 12px;
+      }
+      .video-stage img {
+        width: 100%;
+        min-height: 420px;
+        aspect-ratio: 16 / 9;
+        object-fit: contain;
+        background: #0a0d10;
+        border-radius: 6px;
+        display: block;
+      }
+      .video-placeholder {
+        position: absolute;
+        inset: 12px;
+        display: grid;
+        place-items: center;
+        border-radius: 6px;
+        background: linear-gradient(180deg, rgba(13,20,25,0.88), rgba(13,20,25,0.72));
+      }
+      .video-placeholder.hidden {
+        display: none;
+      }
+      .play-panel {
+        display: grid;
+        justify-items: center;
+        gap: 10px;
+        color: #e8f1f0;
+        text-align: center;
+      }
+      .loading-spinner {
+        width: 34px;
+        height: 34px;
+        border-radius: 999px;
+        border: 3px solid rgba(232,241,240,0.25);
+        border-top-color: #e8f1f0;
+        display: none;
+        animation: spin 0.9s linear infinite;
+      }
+      .video-placeholder.loading .loading-spinner {
+        display: block;
+      }
+      .video-placeholder.loading .play-panel button {
+        display: none;
+      }
+      .play-panel button {
+        border: 0;
+        border-radius: 8px;
+        background: var(--jade);
+        color: #fff;
+        min-height: 44px;
+        padding: 0 18px;
+        font-size: 15px;
+        font-weight: 800;
+        cursor: pointer;
+      }
+      .play-panel p {
+        margin: 0;
+        color: rgba(232,241,240,0.76);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      .control-body {
+        display: grid;
+        gap: 14px;
+        padding: 16px;
+      }
+      .servo-readout {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .metric {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fbfcfb;
+        padding: 12px;
+      }
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .metric strong {
+        display: block;
+        margin-top: 5px;
+        color: var(--ink);
+        font-size: 22px;
+        line-height: 1.1;
+      }
+      .dpad {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(72px, 1fr));
+        gap: 10px;
+        align-items: center;
+      }
+      .dpad button {
+        height: 58px;
+        border: 1px solid #cbd4d8;
+        border-radius: 8px;
+        background: linear-gradient(180deg, #ffffff, #f1f5f4);
+        color: var(--steel);
+        font-size: 25px;
+        font-weight: 900;
+        cursor: pointer;
+        transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+      }
+      .dpad button:hover {
+        border-color: var(--jade);
+        background: #edf7f4;
+        transform: translateY(-1px);
+      }
+      .dpad button:active { transform: translateY(1px); }
+      .dpad .center {
+        background: #172026;
+        color: #fff;
+      }
+      .swing-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .command {
+        height: 48px;
+        border: 1px solid #c8d2d3;
+        border-radius: 8px;
+        background: #fff;
+        color: var(--ink);
+        font-weight: 800;
+        cursor: pointer;
+      }
+      .command.primary {
+        border-color: #a86519;
+        background: #fff5df;
+        color: #7d4611;
+      }
+      .status-line {
+        min-height: 42px;
+        display: flex;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #f7f8f5;
+        padding: 10px 12px;
+        color: #3f4a53;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      .device-info {
+        display: grid;
+        gap: 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fbfcfb;
+        padding: 12px;
+      }
+      .device-info-title {
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 900;
+      }
+      .info-row {
+        display: grid;
+        grid-template-columns: 74px 1fr;
+        gap: 10px;
+        align-items: center;
+        min-height: 28px;
+      }
+      .info-row span {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .info-row strong {
+        min-width: 0;
+        color: #26323a;
+        font-size: 13px;
+        line-height: 1.45;
+        font-weight: 800;
+      }
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .feature {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255,255,255,0.88);
+        padding: 14px;
+      }
+      .feature b {
+        display: block;
+        color: var(--ink);
+        font-size: 15px;
+        margin-bottom: 7px;
+      }
+      .feature p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      @media (max-width: 920px) {
+        .topbar, .main-grid, .feature-grid { grid-template-columns: 1fr; }
+        .status-stack { justify-content: flex-start; }
+        .video-stage img { min-height: 260px; }
+      }
+      @media (max-width: 480px) {
+        .wrap {
+          width: min(100vw - 20px, 1440px);
+          padding-top: 14px;
+        }
+        .servo-readout, .swing-row { grid-template-columns: 1fr; }
+        .dpad { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .dpad button {
+          height: 52px;
+          font-size: 22px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="topbar">
+        <section class="brand">
+          <div class="eyebrow">AI 看店机器人</div>
+          <h1>喵掌柜</h1>
+          <p class="tagline">把招财猫、远程看店和智能迎宾收进一台小小的店铺助手里，替小店守住每一个需要被看见的瞬间。</p>
+        </section>
+        <aside class="status-stack">
+          <div id="routeChip" class="chip bad"><i class="dot"></i><span id="routeText">设备离线</span></div>
+          <div id="cameraChip" class="chip warn"><i class="dot"></i><span id="cameraText">画面等待</span></div>
+        </aside>
+      </header>
+
+      <section class="main-grid">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-title">远程看店</p>
+              <div class="panel-kicker">门店画面</div>
+            </div>
+            <div class="chip"><i class="dot"></i><span id="cameraAgeText">--</span></div>
+          </div>
+          <div class="video-controls">
+            <label for="cameraMode">播放模式</label>
+            <select id="cameraMode">
+              <option value="live" selected>实时监控</option>
+              <option value="buffered">缓冲播放</option>
+            </select>
+            <button id="cameraStopButton" type="button" disabled>停止</button>
+            <button id="cameraRetryButton" type="button" disabled>重新连接</button>
+            <output id="cameraFpsText">接收 -- FPS</output>
+            <output id="cameraModeText">实时 · 不等待缓冲</output>
+          </div>
+          <div class="video-stage">
+            <img id="cameraStream" alt="喵掌柜远程看店画面" />
+            <div id="cameraOverlay" class="video-placeholder">
+              <div class="play-panel">
+                <div class="loading-spinner" aria-hidden="true"></div>
+                <button id="cameraPlayButton" type="button">开启播放</button>
+                <p id="cameraLoadText" role="status">点击后实时查看当前店内画面。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-title">招财猫遥控</p>
+              <div class="panel-kicker">视角与右臂</div>
+            </div>
+            <div class="chip"><i class="dot"></i><span id="deviceIdText">--</span></div>
+          </div>
+          <div class="control-body">
+            <div class="servo-readout">
+              <div class="metric"><span>视角</span><strong id="mgText">--</strong></div>
+              <div class="metric"><span>右臂</span><strong id="sgText">--</strong></div>
+              <div class="metric"><span>招手</span><strong id="swingText">--</strong></div>
+              <div class="metric"><span>连接</span><strong id="routeMetric">--</strong></div>
+            </div>
+
+            <div class="dpad">
+              <span></span><button data-cmd="up" aria-label="上">↑</button><span></span>
+              <button data-cmd="left" aria-label="左">←</button><button class="center" data-cmd="center" aria-label="居中">●</button><button data-cmd="right" aria-label="右">→</button>
+              <span></span><button data-cmd="down" aria-label="下">↓</button><span></span>
+            </div>
+
+            <div class="swing-row">
+              <button class="command primary" data-cmd="swing_toggle">摇臂切换</button>
+              <button class="command" data-cmd="status">刷新状态</button>
+            </div>
+            <div id="status" class="status-line">正在连接喵掌柜...</div>
+            <div class="device-info">
+              <div class="device-info-title">设备信息</div>
+              <div class="info-row"><span>身份</span><strong id="identityText">喵掌柜</strong></div>
+              <div class="info-row"><span>看店</span><strong id="cameraInfoText">等待画面</strong></div>
+              <div class="info-row"><span>能力</span><strong>迎宾互动 · 环境感知 · 招手招财</strong></div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="feature-grid">
+        <article class="feature"><b>会迎宾</b><p>顾客靠近时主动打招呼，让小店多一点温度和记忆点。</p></article>
+        <article class="feature"><b>会守店</b><p>远程查看店内画面，随时确认环境与客流状态。</p></article>
+        <article class="feature"><b>会招财</b><p>招财猫右臂摇摆互动，让传统招幌多一点智能趣味。</p></article>
+      </section>
+    </main>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const routeChip = document.getElementById("routeChip");
+      const cameraChip = document.getElementById("cameraChip");
+      const routeText = document.getElementById("routeText");
+      const cameraText = document.getElementById("cameraText");
+      const cameraAgeText = document.getElementById("cameraAgeText");
+      let cameraStream = document.getElementById("cameraStream");
+      const cameraOverlay = document.getElementById("cameraOverlay");
+      const cameraPlayButton = document.getElementById("cameraPlayButton");
+      const cameraLoadText = document.getElementById("cameraLoadText");
+      const cameraMode = document.getElementById("cameraMode");
+      const cameraStopButton = document.getElementById("cameraStopButton");
+      const cameraRetryButton = document.getElementById("cameraRetryButton");
+      const cameraFpsText = document.getElementById("cameraFpsText");
+      const cameraModeText = document.getElementById("cameraModeText");
+      const deviceIdText = document.getElementById("deviceIdText");
+      const identityText = document.getElementById("identityText");
+      const cameraInfoText = document.getElementById("cameraInfoText");
+      const mgText = document.getElementById("mgText");
+      const sgText = document.getElementById("sgText");
+      const swingText = document.getElementById("swingText");
+      const routeMetric = document.getElementById("routeMetric");
+      const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+      let cameraPlayRequested = false;
+      let cameraPlaying = false;
+      let cameraStreamActive = false;
+      let cameraPageActive = true;
+      let cameraRequestSeq = 0;
+      let cameraRetryTimer = null;
+      let cameraFrameTimer = null;
+      let lastCameraStatus = null;
+
+      function setChip(el, state) {
+        el.classList.remove("good", "warn", "bad");
+        el.classList.add(state);
+      }
+
+      function panLabel(value) {
+        if (value === null || value === undefined) return "--";
+        if (value < 75) return "偏左";
+        if (value > 105) return "偏右";
+        return "居中";
+      }
+
+      function armLabel(value) {
+        if (value === null || value === undefined) return "--";
+        if (value < 75) return "放下";
+        if (value > 105) return "抬起";
+        return "中位";
+      }
+
+      function showCameraLoading(text) {
+        cameraOverlay.classList.remove("hidden");
+        cameraOverlay.classList.add("loading");
+        cameraPlayButton.disabled = true;
+        cameraLoadText.textContent = text;
+      }
+
+      function disconnectCameraStream() {
+        clearTimeout(cameraRetryTimer);
+        clearInterval(cameraFrameTimer);
+        cameraRetryTimer = null;
+        cameraFrameTimer = null;
+        cameraStreamActive = false;
+        cameraPlaying = false;
+        cameraStream.onload = null;
+        cameraStream.onerror = null;
+        cameraStream.removeAttribute("src");
+      }
+
+      function renderCameraState() {
+        const camera = lastCameraStatus;
+        const buffered = cameraMode.value === "buffered";
+        const online = camera?.online === true;
+        const age = camera?.last_frame_age;
+        const fps = camera?.source_fps;
+        cameraStopButton.disabled = !cameraPlayRequested;
+        cameraRetryButton.disabled = !cameraPlayRequested;
+        cameraFpsText.textContent = `接收 ${online && Number.isFinite(fps) ? fps.toFixed(1) : "--"} FPS`;
+        cameraAgeText.textContent = Number.isFinite(age) ? `最新帧 ${Math.max(0, age).toFixed(1)} 秒前` : "等待画面";
+        cameraModeText.textContent = buffered
+          ? `缓冲 · 延迟 ${camera?.playback_delay ?? "--"} 秒`
+          : "实时 · 不等待缓冲";
+        setChip(cameraChip, online ? "good" : "warn");
+        if (!cameraPlayRequested) {
+          cameraOverlay.classList.remove("hidden", "loading");
+          cameraPlayButton.disabled = false;
+          cameraLoadText.textContent = buffered ? "缓冲播放需要先积累画面，会有延迟。" : "点击后实时查看当前店内画面。";
+          cameraText.textContent = online ? "画面在线" : "画面等待";
+          cameraInfoText.textContent = online ? "可开启观看" : "等待画面";
+        } else if (cameraRetryTimer !== null) {
+          setChip(cameraChip, "warn");
+          cameraText.textContent = "正在重连";
+          cameraInfoText.textContent = "播放连接中断";
+          showCameraLoading("播放连接中断，正在重新连接...");
+        } else if (!cameraStreamActive && buffered) {
+          cameraText.textContent = "正在缓冲";
+          cameraInfoText.textContent = "等待缓冲播放";
+          const seconds = Number(camera?.buffered_seconds || 0).toFixed(1);
+          showCameraLoading(`正在缓冲：${seconds}/${camera?.start_buffer_seconds ?? "--"} 秒，${camera?.buffered_frames ?? 0}/${camera?.start_buffer_frames ?? "--"} 帧。可切换实时监控。`);
+        } else if (!cameraPlaying || (!buffered && camera && !online)) {
+          cameraText.textContent = online ? "正在打开" : "等待画面";
+          cameraInfoText.textContent = online ? "正在连接画面" : "等待摄像头恢复";
+          showCameraLoading(online ? "正在连接画面..." : "等待摄像头画面，收到后自动播放...");
+        } else {
+          cameraOverlay.classList.add("hidden");
+          cameraOverlay.classList.remove("loading");
+          cameraText.textContent = buffered ? "缓冲播放" : "实时观看";
+          cameraInfoText.textContent = buffered ? (online ? "延迟画面" : "缓冲画面 · 摄像头离线") : "实时看店";
+        }
+      }
+
+      function startCameraPlayback() {
+        if (!cameraPageActive || !cameraPlayRequested || cameraStreamActive || cameraRetryTimer !== null) return;
+        const buffered = cameraMode.value === "buffered";
+        if (buffered && lastCameraStatus?.playback_ready !== true) return;
+        // A new image isolates late events from a stopped or replaced connection.
+        const stream = cameraStream.cloneNode(false);
+        stream.removeAttribute("src");
+        cameraStream.replaceWith(stream);
+        cameraStream = stream;
+        cameraStreamActive = true;
+        const isCurrentStream = () => cameraPlayRequested && cameraStreamActive && cameraStream === stream;
+        const markPlaying = () => {
+          if (!isCurrentStream() || stream.naturalWidth === 0) return;
+          cameraPlaying = true;
+          clearInterval(cameraFrameTimer);
+          cameraFrameTimer = null;
+          renderCameraState();
+        };
+        stream.onload = markPlaying;
+        stream.onerror = () => {
+          if (!isCurrentStream()) return;
+          disconnectCameraStream();
+          cameraRetryTimer = setTimeout(() => {
+            cameraRetryTimer = null;
+            startCameraPlayback();
+            renderCameraState();
+          }, 2000);
+          renderCameraState();
+        };
+        // MJPEG load events differ between browsers; dimensions prove a frame decoded.
+        cameraFrameTimer = setInterval(markPlaying, 250);
+        stream.src = `${buffered ? "/mjpeg-buffered" : "/mjpeg"}?start=${Date.now()}-${++cameraRequestSeq}`;
+      }
+
+      function requestCameraPlayback() {
+        if (cameraPlayRequested) return;
+        cameraPlayRequested = true;
+        startCameraPlayback();
+        renderCameraState();
+        refreshStatus();
+      }
+
+      function renderStatus(data) {
+        const camera = data?.camera || data?.payload?.camera || null;
+        const control = data?.control || data?.payload?.control || data;
+        const route = control?.route || "unknown";
+        const device = control?.device || {};
+        const uart = control?.uart || {};
+
+        if (camera) {
+          lastCameraStatus = camera;
+          startCameraPlayback();
+          renderCameraState();
+        }
+
+        if (route === "device") {
+          setChip(routeChip, "good");
+          routeText.textContent = "设备在线";
+          routeMetric.textContent = "在线";
+          deviceIdText.textContent = "已连接";
+          identityText.textContent = "喵掌柜在线";
+          statusEl.textContent = "喵掌柜在线，可以远程看店和遥控招手。";
+        } else if (route === "uart") {
+          setChip(routeChip, "warn");
+          routeText.textContent = "本地连接";
+          routeMetric.textContent = "本地";
+          deviceIdText.textContent = "本地";
+          identityText.textContent = "本地调试";
+          statusEl.textContent = "本地调试连接已接入。";
+        } else {
+          setChip(routeChip, "bad");
+          routeText.textContent = "设备离线";
+          routeMetric.textContent = "--";
+          deviceIdText.textContent = "未连接";
+          identityText.textContent = "等待上线";
+          statusEl.textContent = "等待喵掌柜上线。";
+        }
+
+        mgText.textContent = panLabel(device.mg996r);
+        sgText.textContent = armLabel(device.sg90);
+        swingText.textContent = device.swing === true ? "开启" : device.swing === false ? "关闭" : "--";
+      }
+
+      async function refreshStatus() {
+        try {
+          const response = await fetch("/status.json", { cache: "no-store" });
+          renderStatus(await response.json());
+        } catch (_err) {
+          setChip(routeChip, "bad");
+          statusEl.textContent = "暂时无法获取设备状态。";
+        }
+      }
+
+      function sendCommand(cmd) {
+        if (ws.readyState !== WebSocket.OPEN) {
+          statusEl.textContent = "设备暂未连接，稍后再试。";
+          return;
+        }
+        statusEl.textContent = "正在执行...";
+        ws.send(JSON.stringify({ type: "cmd", cmd }));
+      }
+
+      function renderCommandResult(data) {
+        const payload = data.payload || {};
+        if (payload.mg996r !== undefined) mgText.textContent = panLabel(payload.mg996r);
+        if (payload.sg90 !== undefined) sgText.textContent = armLabel(payload.sg90);
+        if (payload.swing !== undefined) {
+          swingText.textContent = payload.swing === true ? "开启" : payload.swing === false ? "关闭" : "--";
+        }
+        if (data.route) routeMetric.textContent = data.route === "device" ? "在线" : data.route === "uart" ? "本地" : "--";
+        statusEl.textContent = data.ok === false ? "指令失败，设备暂未响应。" : "指令已执行。";
+        setTimeout(refreshStatus, 200);
+      }
+
+      ws.onopen = () => refreshStatus();
+      ws.onclose = () => statusEl.textContent = "喵掌柜暂时离线。";
+      ws.onerror = () => statusEl.textContent = "连接暂时异常。";
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.payload?.control || data.control || data.camera) {
+            renderStatus(data.payload || data);
+          } else if (data.payload || data.route || data.ok !== undefined) {
+            renderCommandResult(data);
+          } else {
+            statusEl.textContent = "收到设备更新。";
+          }
+        } catch (_err) {
+          statusEl.textContent = "收到设备消息。";
+        }
+      };
+
+      for (const button of document.querySelectorAll("button[data-cmd]")) {
+        button.addEventListener("click", () => sendCommand(button.dataset.cmd));
+      }
+      cameraPlayButton.addEventListener("click", requestCameraPlayback);
+      cameraStopButton.addEventListener("click", () => {
+        cameraPlayRequested = false;
+        disconnectCameraStream();
+        renderCameraState();
+      });
+      cameraRetryButton.addEventListener("click", () => {
+        if (!cameraPlayRequested) return;
+        disconnectCameraStream();
+        startCameraPlayback();
+        renderCameraState();
+      });
+      cameraMode.addEventListener("change", () => {
+        disconnectCameraStream();
+        startCameraPlayback();
+        renderCameraState();
+      });
+      window.addEventListener("pagehide", () => {
+        cameraPageActive = false;
+        disconnectCameraStream();
+      });
+      window.addEventListener("pageshow", (event) => {
+        cameraPageActive = true;
+        if (event.persisted) {
+          startCameraPlayback();
+          renderCameraState();
+          refreshStatus();
+        }
+      });
+      refreshStatus();
+      setInterval(refreshStatus, 2000);
+    </script>
+  </body>
+</html>
