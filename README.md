@@ -41,6 +41,19 @@ Windows 可用 `go build -o esp32-proxy.exe .`，然后运行 `./esp32-proxy.exe
 
 **安全范围：** 这是可信局域网内的控制服务，默认监听所有网卡。HTTP、WebSocket 和 UDP 都不加密，控制通道没有登录认证，不要直接暴露到公网。`--camera-token` 只保护 HTTP 图片上传，不保护 UDP、网页或动作控制。请使用防火墙限制 TCP 8080 和 UDP 5000，远程访问需另行配置可靠的认证及安全网络。
 
+### 当前阶段：固定参数测试，可自行修改设备目标 IP
+
+目前先测试已有图传和控制功能，不实施下文的身份认证、语音配对或加密计划，也不要求先提供云服务器。可先使用测试电脑的局域网 IPv4，后续再改成受保护测试环境的云服务器 IPv4。
+
+- **Go 服务端：** 保持 HTTP / WebSocket 8080、UDP 5000，以及原有其他默认参数。直接运行 `./esp32-proxy` 即使用这些默认值。`--http-host` / `--udp-host` 的 `0.0.0.0` 是本机监听所有网卡，不是设备连接地址；云公网 IP 可能经云平台 NAT 映射，并不属于服务器本机网卡，**不要将它直接写进监听参数**。
+- **摄像头分支：** 复制 `esp32s3-cam/main/camera_private_config.example.h` 为同目录的 `camera_private_config.h`，将 `ZHIMU_CAM_UDP_HOST` 改为实际服务器 IPv4，`ZHIMU_CAM_UDP_PORT` 保持 `5000`。不填协议、端口或路径；当前摄像头不解析域名。
+- **主控分支：** 复制 `xiaozhi-esp32-main3/main/lucky_cat_private_config.example.h` 为同目录的 `lucky_cat_private_config.h`，将 `ZHIMU_LUCKY_CAT_SERVER_IP` 改为相同 IPv4，自动使用 `ws://该IP:8080/device`。显式私有配置覆盖已有 NVS 地址但不擦写 NVS；空值关闭远程控制；不提供该配置时保持原 NVS → menuconfig 行为。小智 OTA / 语音服务地址不受影响。
+- **浏览器：** 打开 `http://实际服务器IP:8080/`，视频与控制自动使用当前网页地址，无需另改 IP。
+
+两份设备配置属于各自固件，修改后分别重新编译并烧录才会生效；修改 Go 参数不能远程更新 ESP32 的地址。私有配置被 Git 忽略，仓库不保存真实 IP 或 Wi-Fi 密码。其余现有协议、引脚、功能和默认参数保持不变，不新增服务发现或配置下发系统。
+
+**这里只准备本地 / 隔离网络测试，不部署云服务器、不开放公网端口，也不把明文测试服务标记为可安全公网使用。** 下文安全章节仍是后续计划。
+
 ## 接口
 
 | 方法 / 协议 | 路径 | 用途 |
