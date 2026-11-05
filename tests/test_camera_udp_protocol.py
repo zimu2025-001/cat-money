@@ -1,13 +1,16 @@
-"""Compile the real firmware packet encoder and feed it to the Python receiver.
+"""Compile the real firmware packet encoder; optionally test the Python receiver.
 
 This is a host protocol test, not an ESP-IDF build or a hardware FPS benchmark.
 Run from the repository root: python -m unittest discover -s tests -v
+Set CAT_MONEY_PROXY_PATH to a trusted external esp32-proxy.py for integration tests.
 """
 
 import ctypes
 import importlib.util
+import os
 import random
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -15,9 +18,14 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("camera_proxy_protocol_test", ROOT / "esp32-proxy.py")
-proxy = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(proxy)
+HEADER = struct.Struct("!4sIIIHHH")
+PROXY_PATH = os.environ.get("CAT_MONEY_PROXY_PATH")
+proxy = None
+if PROXY_PATH:
+    # Explicit opt-in: this imports executable code from a separate trusted checkout.
+    SPEC = importlib.util.spec_from_file_location("camera_proxy_protocol_test", Path(PROXY_PATH))
+    proxy = importlib.util.module_from_spec(SPEC)
+    SPEC.loader.exec_module(proxy)
 
 
 class FirmwareProtocolTests(unittest.TestCase):
@@ -62,7 +70,7 @@ class FirmwareProtocolTests(unittest.TestCase):
             self.assertLessEqual(size, 1400)
             self.assertEqual(output.raw[1400:], b"\xa5" * 4)
             packet = output.raw[:size]
-            self.assertEqual(proxy.UDP_FRAME_HEADER_V2.unpack_from(packet),
+            self.assertEqual(HEADER.unpack_from(packet),
                              (b"ZMC2", frame_id, len(frame), zlib.crc32(frame), index, count, size - 22))
             packets.append(packet)
         return packets
@@ -84,6 +92,15 @@ class FirmwareProtocolTests(unittest.TestCase):
             with self.subTest(length=length):
                 self.assertEqual(self.lib.cam_udp_chunk_count(length), count)
 
+    def test_encode_payload_boundaries_without_receiver(self):
+        for length in (4, 1377, 1378, 1379, 2756, 30720, 1024 * 1024):
+            with self.subTest(length=length):
+                frame = self.jpeg(length)
+                packets = self.packets(frame)
+                self.assertEqual(len(packets), (length + 1377) // 1378)
+                self.assertEqual(b"".join(packet[HEADER.size:] for packet in packets), frame)
+
+    @unittest.skipUnless(proxy is not None, "set CAT_MONEY_PROXY_PATH for Python receiver integration")
     def test_encode_reassemble_boundaries(self):
         for length in (4, 1377, 1378, 1379, 2756, 30720, 1024 * 1024):
             with self.subTest(length=length):
@@ -94,6 +111,7 @@ class FirmwareProtocolTests(unittest.TestCase):
                     result.extend(assembler.feed(packet))
                 self.assertEqual(result, [frame])
 
+    @unittest.skipUnless(proxy is not None, "set CAT_MONEY_PROXY_PATH for Python receiver integration")
     def test_reordered_chunks_and_duplicates(self):
         frame = self.jpeg(30720)
         packets = self.packets(frame)
@@ -105,6 +123,7 @@ class FirmwareProtocolTests(unittest.TestCase):
             result.extend(assembler.feed(packet))
         self.assertEqual(result, [frame])
 
+    @unittest.skipUnless(proxy is not None, "set CAT_MONEY_PROXY_PATH for Python receiver integration")
     def test_missing_chunk_cannot_publish_partial_frame(self):
         frame = self.jpeg(10000)
         packets = self.packets(frame)
@@ -113,6 +132,7 @@ class FirmwareProtocolTests(unittest.TestCase):
             if index != 2:
                 self.assertEqual(assembler.feed(packet), [])
 
+    @unittest.skipUnless(proxy is not None, "set CAT_MONEY_PROXY_PATH for Python receiver integration")
     def test_payload_corruption_rejected_by_crc(self):
         packets = self.packets(self.jpeg(10000))
         corrupted = bytearray(packets[2])

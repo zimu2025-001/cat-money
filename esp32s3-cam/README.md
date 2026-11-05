@@ -1,7 +1,8 @@
 # ESP32-S3 Camera UDP Stream
 
-An ESP-IDF camera node that sends OV2640 JPEG frames to `../esp32-proxy.py`
-using the ZMC2 UDP protocol. The default image settings remain VGA (640 × 480),
+An ESP-IDF camera node that sends OV2640 JPEG frames to a separately deployed
+ZMC2-compatible receiver. This camera-only branch does not include server code.
+See the [branch README](../README.md) for component branches and dependencies. The default image settings remain VGA (640 × 480),
 JPEG quality 12, two PSRAM frame buffers, and `CAMERA_GRAB_LATEST`.
 
 ## Build and flash
@@ -70,11 +71,11 @@ without C struct padding, matching Python `struct.Struct("!4sIIIHHH")`:
 
 The sender rejects empty, incomplete or larger-than-1-MiB frames. `main/cam_udp_protocol.c`
 is independent of ESP-IDF so the exact firmware encoder can be tested on a host.
-The proxy continues accepting legacy raw JPEG chunks and ZMC1, but only ZMC2 has
+The baseline Python proxy accepts legacy raw JPEG chunks and ZMC1, but only ZMC2 has
 whole-frame CRC validation. Lost/corrupt ZMC2 frames are dropped instead of being
 published as damaged images. Reordering within a complete frame is supported.
 
-The updated proxy isolates ZMC1/ZMC2 assembly by sender IP/port, bounds pending
+The baseline Python proxy isolates ZMC1/ZMC2 assembly by sender IP/port, bounds pending
 frames and bytes, and suppresses older/duplicate completed frame IDs, including
 across uint32 wrap. Because ZMC2 has no boot/session ID, it forgets the last ID
 when no newer frame completes for 5 seconds. A reboot reusing the same sender
@@ -114,10 +115,14 @@ python -m unittest discover -s tests -v
 ```
 
 These tests compile the real packet encoder with strict host compiler warnings
-and check CRC, byte order, packet boundaries and receiver compatibility. Other
-proxy tests cover malformed, lost, reordered, duplicate and late packets. Host
-tests are **not** an ESP-IDF build, flash test or hardware FPS benchmark; run the
-build and hardware checks above before relying on the firmware.
+and check CRC, byte order, packet boundaries and invalid arguments independently.
+Four Python receiver compatibility tests are skipped unless `CAT_MONEY_PROXY_PATH`
+points to a trusted external baseline `esp32-proxy.py`; see the branch README.
+Receiver hardening and viewer tests belong to the separate server/full-project
+checkout and are not bundled here. These optional tests exercise the baseline
+Python receiver, not the Go implementation. Host tests are **not** an ESP-IDF
+build, flash test or hardware FPS benchmark; run the build and hardware checks
+above before relying on the firmware.
 
 ## Layout
 

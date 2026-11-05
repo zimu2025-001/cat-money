@@ -1,9 +1,0 @@
-{
-    "target": "esp32s3",
-    "builds": [
-        {
-            "name": "zhimu-2.25tft-wifi",
-            "sdkconfig_append": []
-        }
-    ]
-}

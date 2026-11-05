@@ -1,5 +1,10 @@
 # Git Tutorial For This Project
 
+> Historical tutorial retained from the original camera project. Names such as
+> `master` and `backup/platformio-original` below are not claims about branches
+> available in this split repository. Follow [the branch README](../README.md)
+> for the current component layout and merge precautions.
+
 This tutorial is written for the current repository and uses the same operations that
 were already performed here.
 
